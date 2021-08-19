@@ -1,0 +1,233 @@
+import warnings
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+import tensorflow.keras.backend as K
+from pandas.tseries.offsets import *
+from tensorflow.keras.models import *
+from tensorflow.keras.layers import *
+from tensorflow.keras.callbacks import *
+from tensorflow.keras.optimizers import *
+from tensorflow.keras.utils import to_categorical
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import f1_score, recall_score, precision_score
+
+warnings.filterwarnings('ignore')
+root_path = '/content/drive/MyDrive/IFLY/yuyu'     # data path
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+def process_time_window(data, features, time_window, istoken=False):
+    this_year_data = data[features[0]]
+    last_year_data = data[features[1]]
+
+    if istoken:
+        time_window = 5
+        X_this_year = np.zeros((this_year_data.shape[0] - time_window, time_window))
+        X_last_year = np.zeros((last_year_data.shape[0] - time_window, time_window))
+
+        for i in range(time_window):
+            X_this_year[:, i] = this_year_data[i:this_year_data.shape[0] - (time_window - i)]
+
+        for i in range(time_window):
+            X_last_year[:, i] = last_year_data[i:last_year_data.shape[0] - (time_window - i)]
+    else:
+        time_window = 5
+        X_this_year = np.zeros((this_year_data.shape[0] - time_window, time_window, this_year_data.shape[1]))
+        X_last_year = np.zeros((last_year_data.shape[0] - time_window, time_window, last_year_data.shape[1]))
+
+        for i in range(time_window):
+            X_this_year[:, i, :] = this_year_data[i:this_year_data.shape[0] - (time_window - i)]
+
+        for i in range(time_window):
+            X_last_year[:, i, :] = last_year_data[i:last_year_data.shape[0] - (time_window - i)]
+    
+    return X_this_year, X_last_year
+
+"""# 新段落"""
+
+all_data = []
+data_list = []
+for i in range(2020, 2009, -1):
+    data = pd.read_csv(f'{root_path}/data/{str(i)}.csv')
+    data['date'] = pd.to_datetime(data['date'], format='%Y%m%d')
+    data['wind_direction'] = data['wind_direction'].apply(lambda x: int(x.split(' ')[3][0]))
+    data['humidity'] = data['humidity'].apply(lambda x: float(x.strip('%')) / 100)
+    # data = data.fillna(method='bfill')
+    all_data.append(data)
+
+for i in range(len(all_data) - 1):
+    data_x, data_y = all_data[i], all_data[i + 1]
+    data_y['date'] = data_y['date'] + DateOffset(years=1)
+    data_list.append(pd.merge(data_x, data_y, on=['date', 'time']))
+    data_y['date'] = data_y['date'] - DateOffset(years=1)
+
+raw_data = pd.concat(data_list[::-1], axis=0)
+
+weather_unique = raw_data['weather_y'].unique()
+time_unique = raw_data['time'].unique()
+weather2id = {weather_unique[i]: i for i in range(weather_unique.shape[0])}
+time2id = {time_unique[i]: i for i in range(time_unique.shape[0])}
+
+raw_data['weather_x'] = raw_data['weather_x'].map(weather2id)
+raw_data['weather_y'] = raw_data['weather_y'].map(weather2id)
+raw_data['time'] = raw_data['time'].map(time2id)
+
+weather_embedding_martix = np.eye(len(weather2id))
+time_embedding_matrix = np.eye(len(time2id))
+
+raw_data['label'] = raw_data['wind_speed_x'].apply(lambda x: [1, 0][x > 6]).shift(-1)
+
+data_set = raw_data[~raw_data['label'].isna()]
+data_set = data_set.fillna(method='bfill')
+data_set = data_set.fillna(method='ffill')
+
+features = [['temperature_x', 'wind_speed_x', 'wind_direction_x', 'humidity_x', 'barometer_x', 'visibility_x'],
+            ['temperature_y', 'wind_speed_y', 'wind_direction_y', 'humidity_y', 'barometer_y', 'visibility_y']]
+time_features = ['time', 'time']
+weather_features = ['weather_x', 'weather_y']
+
+window = 5
+
+X_features_this_year, X_features_last_year = process_time_window(data_set, features, window)
+X_time_features_this_year, X_time_features_last_year = process_time_window(data_set, time_features, window, True)
+X_weather_features_this_year, X_weather_features_last_year = process_time_window(data_set, weather_features, window, True)
+y = data_set['label'][5:].values
+y = to_categorical(y)
+
+class Metrics(tf.keras.callbacks.Callback):
+    def __init__(self, valid_data):
+        super(Metrics, self).__init__()
+        self.validation_data = valid_data
+
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs or {}
+        val_predict = np.argmax(self.model.predict(self.validation_data[0]), -1)
+        val_targ = self.validation_data[1]
+        if len(val_targ.shape) == 2 and val_targ.shape[1] != 1:
+            val_targ = np.argmax(val_targ, -1)
+
+        _val_f1 = f1_score(val_targ, val_predict)
+        _val_recall = recall_score(val_targ, val_predict)
+        _val_precision = precision_score(val_targ, val_predict)
+
+        logs['val_f1'] = _val_f1
+        logs['val_recall'] = _val_recall
+        logs['val_precision'] = _val_precision
+        print(" — val_f1: %f — val_precision: %f — val_recall: %f" % (_val_f1, _val_precision, _val_recall))
+        return
+
+class Self_Attention(Layer):
+ 
+    def __init__(self, output_dim, **kwargs):
+        self.output_dim = output_dim
+        super(Self_Attention, self).__init__(**kwargs)
+ 
+    def build(self, input_shape):
+        # 为该层创建一个可训练的权重
+        #inputs.shape = (batch_size, time_steps, seq_len)
+        self.kernel = self.add_weight(name='kernel',
+                                      shape=(3, input_shape[2], self.output_dim),
+                                      initializer='uniform',
+                                      trainable=True)
+ 
+        super(Self_Attention, self).build(input_shape)  # 一定要在最后调用它
+ 
+    def call(self, x):
+        WQ = K.dot(x, self.kernel[0])
+        WK = K.dot(x, self.kernel[1])
+        WV = K.dot(x, self.kernel[2])
+        # print("WQ.shape",WQ.shape)
+        # print("K.permute_dimensions(WK, [0, 2, 1]).shape",K.permute_dimensions(WK, [0, 2, 1]).shape) 
+ 
+        QK = K.batch_dot(WQ, K.permute_dimensions(WK, [0, 2, 1]))
+        QK = QK / (self.output_dim**0.5) 
+        QK = K.softmax(QK)
+        # print("QK.shape",QK.shape)
+        V = K.batch_dot(QK,WV)
+ 
+        return V[:, 0]
+
+def my_model():
+    this_year_features = Input(shape=(window, 6), dtype='float32')
+    this_year_weather_token = Input(shape=(window,), dtype='int32')
+
+    last_year_features = Input(shape=(window, 6), dtype='float32')
+    last_year_weather_token = Input(shape=(window,), dtype='int32')
+
+    time_token = Input(shape=(window, ), dtype='int32')
+
+    weather_embedder = Embedding(len(weather2id), len(weather2id), input_length=window, weights=[weather_embedding_martix], trainable=False)
+    time_embedder = Embedding(len(time2id), len(time2id), input_length=window, weights=[time_embedding_matrix], trainable=False)
+
+    this_year_weather = weather_embedder(this_year_weather_token)
+    last_year_weather = weather_embedder(last_year_weather_token)
+
+    time = time_embedder(time_token)
+
+    this_year_embedding = concatenate([this_year_features, this_year_weather, time], axis=2)
+    last_year_embedding = concatenate([last_year_features, last_year_weather, time], axis=2)
+
+
+    this_year_hidden = GRU(128, return_sequences=True)(this_year_embedding)
+    this_year_hidden = GRU(64, return_sequences=True)(this_year_hidden)
+    this_year_hidden = GRU(32)(this_year_hidden)
+    this_year_hidden = BatchNormalization()(this_year_hidden)
+
+
+    att_embedding = concatenate([tf.expand_dims(this_year_embedding[:, -1], 1), tf.expand_dims(last_year_embedding[:, -1], 1)], axis=1)
+
+    att_hidden_1 = Self_Attention(64)(att_embedding)
+    att_hidden_2 = Self_Attention(64)(att_embedding)
+
+    att_embedding = concatenate([att_hidden_1, att_hidden_2], axis=1)
+    att_embedding = BatchNormalization()(att_embedding)
+
+    final_embedding = concatenate([this_year_hidden, att_embedding], axis=1)
+    
+    # flat_embedding = BatchNormalization()(final_embedding)
+
+    drop_hidden = Dropout(0.2)(final_embedding)
+    output = Dense(2, activation='softmax')(drop_hidden)
+    print(output)
+    model = Model(inputs=[this_year_features, this_year_weather_token, last_year_features, last_year_weather_token, time_token], outputs=output)
+    opt = Adam(lr=0.00001, decay=10e-5)
+    model.compile(loss='categorical_crossentropy', optimizer=opt, metrics=['accuracy'])
+    return model
+
+folds = StratifiedKFold(n_splits=10, shuffle=True, random_state=2019)
+oof = np.zeros([X_features_this_year.shape[0], 2])
+for fold_, (trn_idx, val_idx) in enumerate(folds.split(X_features_this_year, data_set['label'][5:])):
+    X_trn_features_this_year, X_val_features_this_year = X_features_this_year[trn_idx], X_features_this_year[val_idx]
+    X_trn_features_last_year, X_val_features_last_year = X_features_last_year[trn_idx], X_features_last_year[val_idx]
+    X_trn_time, X_val_time = X_time_features_this_year[trn_idx], X_time_features_this_year[val_idx]
+    X_trn_weather_features_this_year, X_val_weather_features_this_year = X_weather_features_this_year[trn_idx], X_weather_features_this_year[val_idx]
+    X_trn_weather_features_last_year, X_val_weather_features_last_year = X_weather_features_last_year[trn_idx], X_weather_features_last_year[val_idx]
+    y_trn, y_val = y[trn_idx], y[val_idx]
+
+    print("fold n{}".format(fold_ + 1))
+    model = my_model()
+    if fold_ == 0:
+        model.summary()
+    
+    bst_model_path = f"{root_path}/Keras-Model/Model-1/{fold_}.h5"
+    ck_callback = tf.keras.callbacks.ModelCheckpoint(bst_model_path,
+                                                     monitor='val_f1', 
+                                                     mode='max', verbose=2,
+                                                     save_best_only=True,
+                                                     save_weights_only=True)
+
+
+    model.fit([X_trn_features_this_year, X_trn_weather_features_this_year, X_trn_features_last_year, X_trn_weather_features_last_year, X_trn_time], y_trn,
+              validation_data=([X_val_features_this_year, X_val_weather_features_this_year, X_val_features_last_year, X_val_weather_features_last_year, X_val_time], y_val),
+              epochs=128, batch_size=128, shuffle=True,
+              callbacks=[Metrics(valid_data=([X_val_features_this_year, X_val_weather_features_this_year, X_val_features_last_year, X_val_weather_features_last_year, X_val_time], y_val)), 
+                        ck_callback])
+    
+    model.load_weights(bst_model_path)
+    oof[val_idx] = model.predict([X_val_features_this_year, X_val_weather_features_this_year, X_val_features_last_year, X_val_weather_features_last_year, X_val_time])
+    del model
+
+xx_cv = f1_score(data_set['label'][5:], np.argmax(oof, axis=1))
+print("F1", xx_cv)
